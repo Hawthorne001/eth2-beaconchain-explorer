@@ -4,12 +4,6 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
-	"eth2-exporter/db"
-	"eth2-exporter/mail"
-	"eth2-exporter/services"
-	"eth2-exporter/templates"
-	"eth2-exporter/types"
-	"eth2-exporter/utils"
 	"fmt"
 	"html/template"
 	"io"
@@ -18,6 +12,14 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/gobitfly/eth2-beaconchain-explorer/db"
+	"github.com/gobitfly/eth2-beaconchain-explorer/mail"
+	"github.com/gobitfly/eth2-beaconchain-explorer/ratelimit"
+	"github.com/gobitfly/eth2-beaconchain-explorer/services"
+	"github.com/gobitfly/eth2-beaconchain-explorer/templates"
+	"github.com/gobitfly/eth2-beaconchain-explorer/types"
+	"github.com/gobitfly/eth2-beaconchain-explorer/utils"
 
 	ctxt "context"
 
@@ -37,7 +39,7 @@ func UserAuthMiddleware(next http.Handler) http.Handler {
 		user := getUser(r)
 		if !user.Authenticated {
 			utils.SetFlash(w, r, authSessionName, "Error: Please login first")
-			http.Redirect(w, r, "/login", http.StatusSeeOther)
+			http.Redirect(w, r, "/login?redirect="+r.URL.Path, http.StatusSeeOther)
 			return
 		}
 		next.ServeHTTP(w, r)
@@ -87,19 +89,18 @@ func UserSettings(w http.ResponseWriter, r *http.Request) {
 		statsSharing = false
 	}
 
-	maxDaily := utils.Config.Frontend.Ratelimits.FreeDay
-	maxMonthly := utils.Config.Frontend.Ratelimits.FreeMonth
-	if subscription.PriceID != nil {
-		if *subscription.PriceID == utils.Config.Frontend.Stripe.Sapphire {
-			maxDaily = utils.Config.Frontend.Ratelimits.SapphierDay
-			maxMonthly = utils.Config.Frontend.Ratelimits.SapphierMonth
-		} else if *subscription.PriceID == utils.Config.Frontend.Stripe.Emerald {
-			maxDaily = utils.Config.Frontend.Ratelimits.EmeraldDay
-			maxMonthly = utils.Config.Frontend.Ratelimits.EmeraldMonth
-		} else if *subscription.PriceID == utils.Config.Frontend.Stripe.Diamond {
-			maxDaily = utils.Config.Frontend.Ratelimits.DiamondDay
-			maxMonthly = utils.Config.Frontend.Ratelimits.DiamondMonth
-		}
+	rl, err := ratelimit.DBGetUserApiRateLimit(int64(user.UserID))
+	if err != nil {
+		logger.Errorf("Error retrieving the api-ratelimit for user: %v %v", user.UserID, err)
+		utils.SetFlash(w, r, "", "Error: Something went wrong.")
+		http.Redirect(w, r, "/user/settings", http.StatusSeeOther)
+		return
+	}
+
+	maxDaily := int(rl.Second * 24 * 3600)
+	maxMonthly := int(rl.Month)
+	if maxDaily > maxMonthly {
+		maxDaily = maxMonthly
 	}
 
 	userSettingsData.ApiStatistics = &types.ApiStatistics{}
@@ -113,6 +114,16 @@ func UserSettings(w http.ResponseWriter, r *http.Request) {
 			userSettingsData.ApiStatistics = apiStats
 		}
 	}
+
+	// disable delete button if user has active subscription
+	hasUserActiveSubscription, err := getHasUserActiveSubscription(user.UserID)
+	if err != nil {
+		logger.Errorf("Error retrieving the active subscription for user: %v %v", user.UserID, err)
+		utils.SetFlash(w, r, "", "Error: Something went wrong.")
+		http.Redirect(w, r, "/user/settings", http.StatusSeeOther)
+		return
+	}
+	userSettingsData.IsUserDeleteDisabled = hasUserActiveSubscription
 
 	userSettingsData.ApiStatistics.MaxDaily = &maxDaily
 	userSettingsData.ApiStatistics.MaxMonthly = &maxMonthly
@@ -974,36 +985,68 @@ func UserAuthorizeConfirmPost(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func getHasUserActiveSubscription(userId uint64) (bool, error) {
+	var hasUserActiveSubscription bool
+	err := db.FrontendReaderDB.Get(&hasUserActiveSubscription, `
+	SELECT EXISTS (
+		SELECT uss.price_id
+		FROM users_stripe_subscriptions uss
+		LEFT JOIN users u ON u.stripe_customer_id = uss.customer_id
+		WHERE uss.active = true AND u.id = $1
+
+		UNION
+
+		SELECT product_id
+		FROM users_app_subscriptions uas
+		LEFT JOIN users u ON u.id = uas.user_id
+		WHERE uas.active = true AND u.id = $1
+	)`, userId)
+	if err != nil {
+		return false, err
+	}
+	return hasUserActiveSubscription, nil
+}
+
 func UserDeletePost(w http.ResponseWriter, r *http.Request) {
 	logger := logger.WithField("route", r.URL.String())
-	user, session, err := getUserSession(r)
+	user, _, err := getUserSession(r)
 	if err != nil {
 		logger.Errorf("error retrieving session: %v", err)
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
-	if user.Authenticated {
-		err := db.DeleteUserById(user.UserID)
-		if err != nil {
-			logger.Errorf("error deleting user by email for user: %v %v", user.UserID, err)
-			http.Redirect(w, r, "/user/settings", http.StatusSeeOther)
-			utils.SetFlash(w, r, "", "Error: Could not delete user.")
-			session.Save(r, w)
-			http.Redirect(w, r, "/user/settings", http.StatusSeeOther)
-			return
-		}
-
-		Logout(w, r)
-		err = purgeAllSessionsForUser(r.Context(), user.UserID)
-		if err != nil {
-			utils.LogError(err, "error purging sessions for user", 0, map[string]interface{}{"userID": user.UserID})
-			utils.SetFlash(w, r, authSessionName, authInternalServerErrorFlashMsg)
-			http.Redirect(w, r, "/login", http.StatusSeeOther)
-			return
-		}
-	} else {
+	if !user.Authenticated {
 		utils.LogError(nil, "Trying to delete an unauthenticated user", 0)
 		http.Redirect(w, r, "/user/settings", http.StatusSeeOther)
+		return
+	}
+	// don't allow user to delete account if they have an active subscription
+	hasUserActiveSubscription, err := getHasUserActiveSubscription(user.UserID)
+	if err != nil {
+		logger.Errorf("error checking if user has active subscription: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+	if hasUserActiveSubscription {
+		utils.SetFlash(w, r, authSessionName, "Error: You cannot delete your account while you have an active subscription.")
+		http.Redirect(w, r, "/user/settings", http.StatusSeeOther)
+		return
+	}
+
+	err = db.DeleteUserById(user.UserID)
+	if err != nil {
+		logger.Errorf("error deleting user by id for user: %v %v", user.UserID, err)
+		utils.SetFlash(w, r, authSessionName, "Error: Could not delete user.")
+		http.Redirect(w, r, "/user/settings", http.StatusSeeOther)
+		return
+	}
+
+	Logout(w, r)
+	err = purgeAllSessionsForUser(r.Context(), user.UserID)
+	if err != nil {
+		utils.LogError(err, "error purging sessions for user", 0, map[string]interface{}{"userID": user.UserID})
+		utils.SetFlash(w, r, authSessionName, authInternalServerErrorFlashMsg)
+		http.Redirect(w, r, "/login", http.StatusSeeOther)
 		return
 	}
 }
@@ -1046,18 +1089,26 @@ func UserUpdatePasswordPost(w http.ResponseWriter, r *http.Request) {
 	pwdOld := r.FormValue("old-password")
 
 	currentUser := struct {
-		ID        int64  `db:"id"`
-		Email     string `db:"email"`
-		Password  string `db:"password"`
-		Confirmed bool   `db:"email_confirmed"`
+		ID                      int64  `db:"id"`
+		Email                   string `db:"email"`
+		Password                string `db:"password"`
+		Confirmed               bool   `db:"email_confirmed"`
+		PasswordResetNotAllowed bool   `db:"password_reset_not_allowed"`
 	}{}
 
-	err = db.FrontendWriterDB.Get(&currentUser, "SELECT id, email, password, email_confirmed FROM users WHERE id = $1", user.UserID)
+	err = db.FrontendWriterDB.Get(&currentUser, "SELECT id, email, password, email_confirmed, password_reset_not_allowed FROM users WHERE id = $1", user.UserID)
 	if err != nil {
 		if err != sql.ErrNoRows {
 			logger.Errorf("error retrieving password for user %v: %v", user.UserID, err)
 		}
 		session.AddFlash("Error: Invalid password!")
+		session.Save(r, w)
+		http.Redirect(w, r, "/user/settings", http.StatusSeeOther)
+		return
+	}
+
+	if currentUser.PasswordResetNotAllowed {
+		session.AddFlash("Error: Password reset is not allowed for this account!")
 		session.Save(r, w)
 		http.Redirect(w, r, "/user/settings", http.StatusSeeOther)
 		return

@@ -4,12 +4,6 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
-	"eth2-exporter/cache"
-	"eth2-exporter/db"
-	ethclients "eth2-exporter/ethClients"
-	"eth2-exporter/price"
-	"eth2-exporter/types"
-	"eth2-exporter/utils"
 	"fmt"
 	"html/template"
 	"math"
@@ -18,6 +12,14 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/gobitfly/eth2-beaconchain-explorer/cache"
+	"github.com/gobitfly/eth2-beaconchain-explorer/db"
+	ethclients "github.com/gobitfly/eth2-beaconchain-explorer/ethClients"
+	"github.com/gobitfly/eth2-beaconchain-explorer/price"
+	"github.com/gobitfly/eth2-beaconchain-explorer/ratelimit"
+	"github.com/gobitfly/eth2-beaconchain-explorer/types"
+	"github.com/gobitfly/eth2-beaconchain-explorer/utils"
 
 	itypes "github.com/gobitfly/eth-rewards/types"
 	"github.com/shopspring/decimal"
@@ -84,6 +86,10 @@ func Init() {
 
 	ready.Add(1)
 	go latestExportedStatisticDayUpdater(ready)
+
+	if utils.Config.RatelimitUpdater.Enabled {
+		go ratelimit.DBUpdater()
+	}
 
 	ready.Wait()
 }
@@ -817,7 +823,7 @@ func getIndexPageData() (*types.IndexPageData, error) {
 			blocks.parentroot,
 			blocks.attestationscount,
 			blocks.depositscount,
-			blocks.withdrawalcount, 
+			COALESCE(blocks.withdrawalcount,0) as withdrawalcount, 
 			blocks.voluntaryexitscount,
 			blocks.proposerslashingscount,
 			blocks.attesterslashingscount,
@@ -1297,7 +1303,7 @@ func getGasNowData() (*types.GasNowPageData, error) {
 	var raw json.RawMessage
 	err = client.Call(&raw, "eth_getBlockByNumber", "pending", true)
 	if err != nil {
-		return nil, fmt.Errorf("error retrieving pending block data: %v", err)
+		return nil, fmt.Errorf("error retrieving pending block data: %.1000s", err) // limit error message to 1000 characters
 	}
 
 	// var res map[string]interface{}
@@ -1497,6 +1503,7 @@ func mempoolUpdater(wg *sync.WaitGroup) {
 				if tx.GasPrice == nil {
 					tx.GasPrice = tx.GasFeeCap
 				}
+				tx.Input = nil // nil inputs to save space
 			}
 		}
 		for _, txs := range mempoolTx.Queued {
@@ -1506,6 +1513,7 @@ func mempoolUpdater(wg *sync.WaitGroup) {
 				if tx.GasPrice == nil {
 					tx.GasPrice = tx.GasFeeCap
 				}
+				tx.Input = nil // nil inputs to save space
 			}
 		}
 		for _, txs := range mempoolTx.BaseFee {
@@ -1515,6 +1523,7 @@ func mempoolUpdater(wg *sync.WaitGroup) {
 				if tx.GasPrice == nil {
 					tx.GasPrice = tx.GasFeeCap
 				}
+				tx.Input = nil // nil inputs to save space
 			}
 		}
 

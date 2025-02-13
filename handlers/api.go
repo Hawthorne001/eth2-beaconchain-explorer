@@ -8,12 +8,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"eth2-exporter/db"
-	"eth2-exporter/exporter"
-	"eth2-exporter/price"
-	"eth2-exporter/services"
-	"eth2-exporter/types"
-	"eth2-exporter/utils"
 	"fmt"
 	"io"
 	"math/big"
@@ -24,6 +18,14 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"github.com/gobitfly/eth2-beaconchain-explorer/db"
+	"github.com/gobitfly/eth2-beaconchain-explorer/exporter"
+	"github.com/gobitfly/eth2-beaconchain-explorer/metrics"
+	"github.com/gobitfly/eth2-beaconchain-explorer/price"
+	"github.com/gobitfly/eth2-beaconchain-explorer/services"
+	"github.com/gobitfly/eth2-beaconchain-explorer/types"
+	"github.com/gobitfly/eth2-beaconchain-explorer/utils"
 
 	"github.com/ethereum/go-ethereum/common"
 	gorillacontext "github.com/gorilla/context"
@@ -257,6 +259,34 @@ func ApiEthStoreDay(w http.ResponseWriter, r *http.Request) {
 	returnQueryResults(rows, w, r, addDayTime)
 }
 
+// ApiLatestState godoc
+// @Summary Get the latest state of the network
+// @Tags Network
+// @Description Returns information on the current state of the network
+// @Produce  json
+// @Failure 400 {object} types.ApiResponse "Failure"
+// @Failure 500 {object} types.ApiResponse "Server Error"
+// @Router /api/v1/latestState [get]
+func ApiLatestState(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", fmt.Sprintf("public, max-age=%d", utils.Config.Chain.ClConfig.SecondsPerSlot)) // set local cache to the seconds per slot interval
+
+	data := services.LatestState()
+	data.Rates = services.GetRates(GetCurrency(r))
+	userAgent := r.Header.Get("User-Agent")
+	userAgent = strings.ToLower(userAgent)
+	if strings.Contains(userAgent, "android") || strings.Contains(userAgent, "iphone") || strings.Contains(userAgent, "windows phone") {
+		data.Rates.MainCurrencyPriceFormatted = utils.KFormatterEthPrice(uint64(data.Rates.MainCurrencyPrice))
+	}
+
+	err := json.NewEncoder(w).Encode(data)
+	if err != nil {
+		logger.Errorf("error sending latest index page data: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+}
+
 // ApiEpoch godoc
 // @Summary Get epoch by number, latest, finalized
 // @Tags Epoch
@@ -297,7 +327,7 @@ func ApiEpoch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rows, err := db.ReaderDb.Query(`SELECT attestationscount, attesterslashingscount, averagevalidatorbalance, blockscount, depositscount, eligibleether, epoch, (epoch <= $2) AS finalized, globalparticipationrate, proposerslashingscount, rewards_exported, totalvalidatorbalance, validatorscount, voluntaryexitscount, votedether, withdrawalcount, 
+	rows, err := db.ReaderDb.Query(`SELECT attestationscount, attesterslashingscount, averagevalidatorbalance, blockscount, depositscount, eligibleether, epoch, (epoch <= $2) AS finalized, globalparticipationrate, proposerslashingscount, rewards_exported, totalvalidatorbalance, validatorscount, voluntaryexitscount, votedether, COALESCE(withdrawalcount,0) as withdrawalcount, 
 		(SELECT COUNT(*) FROM blocks WHERE epoch = $1 AND status = '0') as scheduledblocks,
 		(SELECT COUNT(*) FROM blocks WHERE epoch = $1 AND status = '1') as proposedblocks,
 		(SELECT COUNT(*) FROM blocks WHERE epoch = $1 AND status = '2') as missedblocks,
@@ -355,7 +385,7 @@ func ApiEpochSlots(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rows, err := db.ReaderDb.Query("SELECT attestationscount, attesterslashingscount, blockroot, depositscount, epoch, eth1data_blockhash, eth1data_depositcount, eth1data_depositroot, exec_base_fee_per_gas, exec_block_hash, exec_block_number, exec_extra_data, exec_fee_recipient, exec_gas_limit, exec_gas_used, exec_logs_bloom, exec_parent_hash, exec_random, exec_receipts_root, exec_state_root, exec_timestamp, exec_transactions_count, graffiti, graffiti_text, parentroot, proposer, proposerslashingscount, randaoreveal, signature, slot, stateroot, status, syncaggregate_bits, syncaggregate_participation, syncaggregate_signature, voluntaryexitscount, withdrawalcount FROM blocks WHERE epoch = $1 ORDER BY slot", epoch)
+	rows, err := db.ReaderDb.Query("SELECT attestationscount, attesterslashingscount, blockroot, depositscount, epoch, eth1data_blockhash, eth1data_depositcount, eth1data_depositroot, exec_base_fee_per_gas, exec_block_hash, exec_block_number, exec_extra_data, exec_fee_recipient, exec_gas_limit, exec_gas_used, exec_logs_bloom, exec_parent_hash, exec_random, exec_receipts_root, exec_state_root, exec_timestamp, COALESCE(exec_transactions_count,0) as exec_transactions_count, graffiti, graffiti_text, parentroot, proposer, proposerslashingscount, randaoreveal, signature, slot, stateroot, status, syncaggregate_bits, syncaggregate_participation, syncaggregate_signature, voluntaryexitscount, COALESCE(withdrawalcount,0) as withdrawalcount FROM blocks WHERE epoch = $1 ORDER BY slot", epoch)
 	if err != nil {
 		sendServerErrorResponse(w, r.URL.String(), "could not retrieve db results")
 		return
@@ -434,7 +464,7 @@ func ApiSlots(w http.ResponseWriter, r *http.Request) {
 		blocks.attesterslashingscount,
 		blocks.attestationscount,
 		blocks.depositscount,
-		blocks.withdrawalcount, 
+		COALESCE(withdrawalcount,0) as withdrawalcount, 
 		blocks.voluntaryexitscount,
 		blocks.proposer,
 		blocks.status,
@@ -1198,7 +1228,13 @@ func getSyncCommitteeSlotsStatistics(validators []uint64, epoch uint64) (types.S
 		lastExportedEpoch = ((lastExportedDay + 1) * epochsPerDay) - 1
 	}
 
-	err = db.ReaderDb.Get(&syncStats, `SELECT SUM(COALESCE(participated_sync_total, 0)) AS participated, SUM(COALESCE(missed_sync_total, 0)) AS missed FROM validator_stats WHERE day = $1 AND validatorindex = ANY($2)`, lastExportedDay, pq.Array(validators))
+	err = db.ReaderDb.Get(&syncStats, `
+		SELECT 
+		COALESCE(SUM(COALESCE(participated_sync_total, 0)), 0) AS participated, 
+		COALESCE(SUM(COALESCE(missed_sync_total, 0)),0) AS missed 
+		FROM validator_stats 
+		WHERE day = $1 AND validatorindex = ANY($2)
+		`, lastExportedDay, pq.Array(validators))
 	if err != nil {
 		return types.SyncCommitteesStats{}, err
 	}
@@ -2915,6 +2951,9 @@ func getTokenByCode(w http.ResponseWriter, r *http.Request) {
 		pkg.Package = "standard"
 	}
 
+	// BIDS-3049 mobile app uses v1 package ids only
+	pkg.Package = utils.MapProductV2ToV1(pkg.Package)
+
 	var theme string = ""
 	if pkg.Store == "ethpool" {
 		theme = "ethpool"
@@ -2968,6 +3007,9 @@ func getTokenByRefresh(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		pkg.Package = "standard"
 	}
+
+	// BIDS-3049 mobile app uses v1 package ids only
+	pkg.Package = utils.MapProductV2ToV1(pkg.Package)
 
 	var theme string = ""
 	if pkg.Store == "ethpool" {
@@ -3104,6 +3146,11 @@ func RegisterMobileSubscriptions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if parsedBase.ProductID == "plankton" {
+		SendBadRequestResponse(w, r.URL.String(), "old product")
+		return
+	}
+
 	// Only allow ios and android purchases to be registered via this endpoint
 	if parsedBase.Transaction.Type != "ios-appstore" && parsedBase.Transaction.Type != "android-playstore" {
 		SendBadRequestResponse(w, r.URL.String(), "invalid transaction type")
@@ -3196,6 +3243,8 @@ func GetUserPremiumByPackage(pkg string) PremiumUser {
 		NotificationThresholds: false,
 		NoAds:                  false,
 	}
+
+	pkg = utils.MapProductV2ToV1(pkg)
 
 	if pkg == "" || pkg == "standard" {
 		return result
@@ -3595,19 +3644,24 @@ func clientStatsPost(w http.ResponseWriter, r *http.Request, apiKey, machine str
 		return
 	}
 
+	userDataRetrievalStartTs := time.Now()
 	userData, err := db.GetUserIdByApiKey(apiKey)
 	if err != nil {
 		SendBadRequestResponse(w, r.URL.String(), "no user found with api key")
 		return
 	}
+	metrics.TaskDuration.WithLabelValues("client_stats_post_user_data_retrieve").Observe(time.Since(userDataRetrievalStartTs).Seconds())
 
+	bodyDataReadingStartTs := time.Now()
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		logger.Warnf("error reading body | err: %v", err)
 		SendBadRequestResponse(w, r.URL.String(), "could not read body")
 		return
 	}
+	metrics.TaskDuration.WithLabelValues("client_stats_post_body_data_read").Observe(time.Since(bodyDataReadingStartTs).Seconds())
 
+	bodyDataParseStartTs := time.Now()
 	var jsonObjects []map[string]interface{}
 	err = json.Unmarshal(body, &jsonObjects)
 	if err != nil {
@@ -3626,6 +3680,7 @@ func clientStatsPost(w http.ResponseWriter, r *http.Request, apiKey, machine str
 		SendBadRequestResponse(w, r.URL.String(), "Max number of stat entries are 10")
 		return
 	}
+	metrics.TaskDuration.WithLabelValues("client_stats_post_body_data_parse").Observe(time.Since(bodyDataParseStartTs).Seconds())
 
 	var rateLimitErrs = 0
 	var result bool = false
@@ -3655,7 +3710,7 @@ func clientStatsPost(w http.ResponseWriter, r *http.Request, apiKey, machine str
 }
 
 func insertStats(userData *types.UserWithPremium, machine string, body *map[string]interface{}, w http.ResponseWriter, r *http.Request) error {
-
+	dataParseStartTs := time.Now()
 	var parsedMeta *types.StatsMeta
 	err := mapstructure.Decode(body, &parsedMeta)
 	if err != nil {
@@ -3675,9 +3730,13 @@ func insertStats(userData *types.UserWithPremium, machine string, body *map[stri
 		SendBadRequestResponse(w, r.URL.String(), "unknown process")
 		return fmt.Errorf("unknown process")
 	}
+	metrics.TaskDuration.WithLabelValues("client_stats_post_insert_data_parse").Observe(time.Since(dataParseStartTs).Seconds())
 
+	getUserPremiumByPackageStartTs := time.Now()
 	maxNodes := GetUserPremiumByPackage(userData.Product.String).MaxNodes
+	metrics.TaskDuration.WithLabelValues("client_stats_post_insert_data_get_premium").Observe(time.Since(getUserPremiumByPackageStartTs).Seconds())
 
+	getMachineMetricsMachineCountStartTs := time.Now()
 	count, err := db.BigtableClient.GetMachineMetricsMachineCount(userData.ID)
 	if err != nil {
 		logger.Errorf("Could not get max machine count| %v", err)
@@ -3689,7 +3748,9 @@ func insertStats(userData *types.UserWithPremium, machine string, body *map[stri
 		sendErrorWithCodeResponse(w, r.URL.String(), "reached max machine count", 402)
 		return fmt.Errorf("user has reached max machine count")
 	}
+	metrics.TaskDuration.WithLabelValues("client_stats_post_insert_data_get_machine_count").Observe(time.Since(getMachineMetricsMachineCountStartTs).Seconds())
 
+	dataEncodeStartTs := time.Now()
 	var data []byte
 	if parsedMeta.Process == "system" {
 		var parsedResponse *types.MachineMetricSystem
@@ -3734,6 +3795,7 @@ func insertStats(userData *types.UserWithPremium, machine string, body *map[stri
 			return err
 		}
 	}
+	metrics.TaskDuration.WithLabelValues("client_stats_post_insert_data_encode").Observe(time.Since(dataEncodeStartTs).Seconds())
 
 	err = db.BigtableClient.SaveMachineMetric(parsedMeta.Process, userData.ID, machine, data)
 	if err != nil {

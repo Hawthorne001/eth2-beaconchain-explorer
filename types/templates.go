@@ -1220,14 +1220,15 @@ type CsrfData struct {
 type UserSettingsPageData struct {
 	CsrfField template.HTML
 	AuthData
-	Subscription        UserSubscription
-	Premium             UserPremiumSubscription
-	PairedDevices       []PairedDevice
-	Sapphire            *string
-	Emerald             *string
-	Diamond             *string
-	ShareMonitoringData bool
-	ApiStatistics       *ApiStatistics
+	Subscription         UserSubscription
+	Premium              UserPremiumSubscription
+	PairedDevices        []PairedDevice
+	Sapphire             *string
+	Emerald              *string
+	Diamond              *string
+	ShareMonitoringData  bool
+	ApiStatistics        *ApiStatistics
+	IsUserDeleteDisabled bool
 }
 
 type PairedDevice struct {
@@ -1319,6 +1320,12 @@ type MobilePricing struct {
 	Plankton             string
 	Goldfish             string
 	Whale                string
+	Guppy                string
+	GuppyYearly          string
+	Dolphin              string
+	DolphinYearly        string
+	Orca                 string
+	OrcaYearly           string
 	ActiveMobileStoreSub bool
 }
 
@@ -1326,6 +1333,13 @@ type StakeWithUsPageData struct {
 	FlashMessage string
 	RecaptchaKey string
 }
+
+type PasswordResetNotAllowedError struct{}
+
+func (e *PasswordResetNotAllowedError) Error() string {
+	return "password reset not allowed for this account"
+}
+
 type RateLimitError struct {
 	TimeLeft time.Duration
 }
@@ -1691,6 +1705,7 @@ type ITransaction struct {
 		// Usage    uint64
 		// UsedPerc float64
 	}
+	Reverted bool
 }
 
 type Transfer struct {

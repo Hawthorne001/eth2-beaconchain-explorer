@@ -11,9 +11,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"eth2-exporter/config"
-	"eth2-exporter/price"
-	"eth2-exporter/types"
 	"fmt"
 	"html/template"
 	"image/color"
@@ -31,8 +28,13 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 	"unicode/utf8"
+
+	"github.com/gobitfly/eth2-beaconchain-explorer/config"
+	"github.com/gobitfly/eth2-beaconchain-explorer/price"
+	"github.com/gobitfly/eth2-beaconchain-explorer/types"
 
 	"golang.org/x/text/cases"
 	"golang.org/x/text/language"
@@ -394,7 +396,7 @@ func GWeiBytesToEther(gwei []byte) decimal.Decimal {
 // WaitForCtrlC will block/wait until a control-c is pressed
 func WaitForCtrlC() {
 	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt)
+	signal.Notify(c, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
 	<-c
 }
 
@@ -742,31 +744,6 @@ func ReadConfig(cfg *types.Config, path string) error {
 
 	if cfg.Frontend.Keywords == "" {
 		cfg.Frontend.Keywords = "open source ethereum block explorer, ethereum block explorer, beacon chain explorer, ethereum blockchain explorer"
-	}
-
-	if cfg.Frontend.Ratelimits.FreeDay == 0 {
-		cfg.Frontend.Ratelimits.FreeDay = 30000
-	}
-	if cfg.Frontend.Ratelimits.FreeMonth == 0 {
-		cfg.Frontend.Ratelimits.FreeMonth = 30000
-	}
-	if cfg.Frontend.Ratelimits.SapphierDay == 0 {
-		cfg.Frontend.Ratelimits.SapphierDay = 100000
-	}
-	if cfg.Frontend.Ratelimits.SapphierMonth == 0 {
-		cfg.Frontend.Ratelimits.SapphierMonth = 500000
-	}
-	if cfg.Frontend.Ratelimits.EmeraldDay == 0 {
-		cfg.Frontend.Ratelimits.EmeraldDay = 200000
-	}
-	if cfg.Frontend.Ratelimits.EmeraldMonth == 0 {
-		cfg.Frontend.Ratelimits.EmeraldMonth = 1000000
-	}
-	if cfg.Frontend.Ratelimits.DiamondDay == 0 {
-		cfg.Frontend.Ratelimits.DiamondDay = 6000000
-	}
-	if cfg.Frontend.Ratelimits.DiamondMonth == 0 {
-		cfg.Frontend.Ratelimits.DiamondMonth = 6000000
 	}
 
 	if cfg.Chain.Id != 0 {
@@ -1500,6 +1477,12 @@ func LogFatal(err error, errorMsg interface{}, callerSkip int, additionalInfos .
 // callerSkip equal to 0 gives you info directly where LogError is called.
 func LogError(err error, errorMsg interface{}, callerSkip int, additionalInfos ...map[string]interface{}) {
 	logErrorInfo(err, callerSkip, additionalInfos...).Error(errorMsg)
+}
+
+// LogError logs a warning with callstack info that skips callerSkip many levels with arbitrarily many additional infos.
+// callerSkip equal to 0 gives you info directly where LogError is called.
+func LogWarn(err error, errorMsg interface{}, callerSkip int, additionalInfos ...map[string]interface{}) {
+	logErrorInfo(err, callerSkip, additionalInfos...).Warn(errorMsg)
 }
 
 func logErrorInfo(err error, callerSkip int, additionalInfos ...map[string]interface{}) *logrus.Entry {
